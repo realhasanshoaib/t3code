@@ -160,6 +160,8 @@ export const ExecutionEnvironmentDescriptor = Schema.Struct({
   label: TrimmedNonEmptyString,
   platform: ExecutionEnvironmentPlatform,
   serverVersion: TrimmedNonEmptyString,
+  /** Changes when the server restarts, invalidating in-memory replay cursors. */
+  serverEpoch: Schema.optionalKey(TrimmedNonEmptyString),
   orchestrationProtocolVersion: Schema.optionalKey(Schema.Int),
   capabilities: ExecutionEnvironmentCapabilities,
 });

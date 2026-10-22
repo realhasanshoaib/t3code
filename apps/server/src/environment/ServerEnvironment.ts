@@ -186,6 +186,8 @@ export const make = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const identity = yield* ServerEnvironmentIdentity;
+  const crypto = yield* Crypto.Crypto;
+  const serverEpoch = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
   const hostPlatform = yield* HostProcess.Platform;
   const hostArchitecture = yield* HostProcess.Architecture;
   const environmentId = yield* identity.getEnvironmentId;
@@ -214,6 +216,7 @@ export const make = Effect.gen(function* () {
       ...(machine === null ? {} : { machine }),
     },
     serverVersion: packageJson.version,
+    serverEpoch,
     orchestrationProtocolVersion: ORCHESTRATION_PROTOCOL_VERSION,
     capabilities: {
       repositoryIdentity: true,

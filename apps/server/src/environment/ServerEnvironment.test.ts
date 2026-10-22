@@ -202,7 +202,9 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
 
       const first = yield* Effect.gen(function* () {
         const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
-        return yield* serverEnvironment.getDescriptor;
+        const descriptor = yield* serverEnvironment.getDescriptor;
+        expect((yield* serverEnvironment.getDescriptor).serverEpoch).toBe(descriptor.serverEpoch);
+        return descriptor;
       }).pipe(Effect.provide(layerServerEnvironment(baseDir)));
       const second = yield* Effect.gen(function* () {
         const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
@@ -210,6 +212,9 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
       }).pipe(Effect.provide(layerServerEnvironment(baseDir)));
 
       expect(first.environmentId).toBe(second.environmentId);
+      expect(first.serverEpoch).toBeDefined();
+      expect(second.serverEpoch).toBeDefined();
+      expect(first.serverEpoch).not.toBe(second.serverEpoch);
       expect(first.orchestrationProtocolVersion).toBe(ORCHESTRATION_PROTOCOL_VERSION);
       expect(second.capabilities.repositoryIdentity).toBe(true);
       expect(second.capabilities.connectionProbe).toBe(true);

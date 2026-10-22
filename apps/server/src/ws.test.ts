@@ -288,6 +288,58 @@ it.live.each(["thread", "shell"] as const)(
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
+it.effect.each([
+  { afterSequence: 1, headSequence: 1002 },
+  { afterSequence: 40, headSequence: 20 },
+])("shell resume falls back to a snapshot for an unusable cursor: %j", (input) =>
+  Effect.gen(function* () {
+    const updates = yield* PubSub.unbounded<ProjectEnrichment.ProjectEnrichmentChange>();
+    const items = yield* subscribeOrchestrationV2Shell({
+      afterSequence: input.afterSequence,
+      requestCompletionMarker: true,
+    }).pipe(
+      Effect.flatMap((stream) => stream.pipe(Stream.take(2), Stream.runCollect)),
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({
+            latestApplicationSequence: Effect.succeed(input.headSequence),
+            streamProjectedApplicationEvents: () => Stream.never,
+          }),
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            readShellSnapshot: () =>
+              Effect.succeed(
+                Effect.succeed({
+                  schemaVersion: 1,
+                  snapshotSequence: input.headSequence,
+                  threads: [],
+                  archivedThreads: [],
+                }),
+              ),
+          }),
+          Layer.mock(ProjectStore.ProjectStoreV2)({ listShells: () => Effect.succeed([]) }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(ProjectEnrichment.ProjectEnrichmentService)({
+            subscribeChanges: PubSub.subscribe(updates),
+          }),
+        ),
+      ),
+    );
+    assert.deepEqual(items, [
+      {
+        kind: "snapshot",
+        snapshot: {
+          schemaVersion: 1,
+          snapshotSequence: input.headSequence,
+          projects: [],
+          threads: [],
+          archivedThreads: [],
+        },
+      },
+      { kind: "synchronized" },
+    ]);
+  }).pipe(Effect.scoped, Effect.provide(SqlitePersistence.layerMemory)),
+);
+
 // Build the production RPC layer; unrelated capabilities fail if this test calls them.
 const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(ServerSecretStore.ServerSecretStore)({}),

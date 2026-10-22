@@ -9,7 +9,15 @@ import {
   markdownWithInlineFileLinks,
   markdownWithTableBreaks,
 } from "../lib/markdownDocument";
-import { useCallback, useMemo, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { Platform, Share, StyleSheet, View } from "react-native";
 import {
   EnrichedMarkdownText,
@@ -165,6 +173,16 @@ export function MobileEnrichedMarkdownText(props: SelectableMarkdownTextProps) {
     [props.markdown],
   );
   const [documentAssets, setDocumentAssets] = useState<DocumentAssetsEvent["assets"]>([]);
+  const previousDocument = useRef({ key: props.documentKey, markdown });
+  useLayoutEffect(() => {
+    const previous = previousDocument.current;
+    previousDocument.current = { key: props.documentKey, markdown };
+    // Native emits no new manifest for identical text. Other recycled documents
+    // must drop the previous link pills before paint, without remounting text.
+    if (previous.key !== props.documentKey && previous.markdown !== markdown) {
+      setDocumentAssets([]);
+    }
+  }, [props.documentKey, markdown]);
   const onDocumentAssets = useCallback(({ assets }: DocumentAssetsEvent) => {
     setDocumentAssets((previous) =>
       previous.length === assets.length &&
@@ -191,10 +209,13 @@ export function MobileEnrichedMarkdownText(props: SelectableMarkdownTextProps) {
     }),
     [props.skills],
   );
-  const [activeMenu, setActiveMenu] = useState<{
+  const [menuDocument, setActiveMenu] = useState<{
+    key: string | undefined;
     url: string;
     menu: NonNullable<ReturnType<NonNullable<typeof props.fileContextMenu>>>;
   } | null>(null);
+  const activeMenu = menuDocument?.key === props.documentKey ? menuDocument : null;
+  if (menuDocument && menuDocument.key !== props.documentKey) setActiveMenu(null);
   const { fileContextMenu, onLinkPress, onFileContextMenuAction } = props;
   const performMenuAction = useCallback(
     (url: string, actionId: string) => {
@@ -265,13 +286,20 @@ export function MobileEnrichedMarkdownText(props: SelectableMarkdownTextProps) {
     [props.textStyle, themeAppearance, linkVariants],
   );
   const renderMedia = useCallback(
-    (asset: MarkdownMediaAsset) =>
-      renderImage?.({
-        href: asset.url,
-        alt: asset.altText || null,
-        title: asset.title || null,
-      }) ?? null,
-    [renderImage],
+    (asset: MarkdownMediaAsset) => {
+      const content =
+        renderImage?.({
+          href: asset.url,
+          alt: asset.altText || null,
+          title: asset.title || null,
+        }) ?? null;
+      return content === null || typeof content === "boolean" ? (
+        content
+      ) : (
+        <Fragment key={props.documentKey}>{content}</Fragment>
+      );
+    },
+    [renderImage, props.documentKey],
   );
   const resolveNativeImageSource = useCallback(
     (asset: MarkdownMediaAsset) =>
@@ -293,7 +321,7 @@ export function MobileEnrichedMarkdownText(props: SelectableMarkdownTextProps) {
                 { id: "enriched-copy-link", title: "Copy link" },
               ],
             };
-            setActiveMenu({ url, menu });
+            setActiveMenu({ key: props.documentKey, url, menu });
             openAndroidMenu?.();
           }
         : undefined;

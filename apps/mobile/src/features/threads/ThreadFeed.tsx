@@ -220,6 +220,7 @@ import {
   WORK_GROUP_TOGGLE_HEIGHT,
 } from "./thread-work-log";
 import { appendPendingThreadMessages, type PendingThreadFeedEntry } from "./pending-thread-feed";
+import { threadFeedItemType, threadFeedRenderKey } from "./thread-feed-recycling";
 import type { QueuedThreadMessage } from "../../state/thread-outbox-model";
 import { resolveThreadFeedFixedItemSize } from "./thread-feed-item-size";
 import { htmlRenderFrameHeight } from "@t3tools/shared/htmlRender";
@@ -751,12 +752,23 @@ function MessageAttachmentUnknown(props: { readonly name: string }) {
 // LegendList only computes hook visibility when the list has a viewability config.
 const THREAD_MEDIA_VIEWABILITY_CONFIG = { itemVisiblePercentThreshold: 0 };
 
-function ThreadMediaVisibility(props: { readonly children: ReactNode }) {
-  const [visible, setVisible] = useState(false);
+function ThreadMediaVisibility(props: { readonly entryId: string; readonly children: ReactNode }) {
+  const [visibility, setVisibility] = useState<{ key: string; visible: boolean } | null>(null);
   useViewabilityAmount<ThreadFeedEntry>(
-    useCallback((token) => setVisible(token.sizeVisible > 0), []),
+    useCallback((token) => {
+      const visible = token.sizeVisible > 0;
+      setVisibility((previous) =>
+        previous?.key === token.key && previous.visible === visible
+          ? previous
+          : { key: token.key, visible },
+      );
+    }, []),
   );
-  return <ThreadMediaVisibleContext value={visible}>{props.children}</ThreadMediaVisibleContext>;
+  return (
+    <ThreadMediaVisibleContext value={visibility?.key === props.entryId && visibility.visible}>
+      {props.children}
+    </ThreadMediaVisibleContext>
+  );
 }
 
 interface MarkdownLinkHandlers {
@@ -836,6 +848,7 @@ function ArtifactTemplateCard(props: {
 }
 
 const AssistantMarkdownContent = memo(function AssistantMarkdownContent(props: {
+  readonly messageId?: string;
   readonly markdown: string;
   readonly environmentId: EnvironmentId;
   readonly markdownStyles: MarkdownStyleSet;
@@ -863,6 +876,7 @@ const AssistantMarkdownContent = memo(function AssistantMarkdownContent(props: {
     return (
       <SelectableMarkdownText
         key={`markdown:${segment.sourceOffset}`}
+        documentKey={props.messageId}
         markdown={markdown}
         skills={props.skills}
         textStyle={props.markdownStyles.nativeTextStyle}
@@ -1568,6 +1582,7 @@ function renderFeedEntry(
         {renderedText.trim().length > 0 ? (
           <MarkdownImageAvailableWidthContext value={props.markdownContentWidth}>
             <AssistantMarkdownContent
+              messageId={message.id}
               markdown={renderedText}
               environmentId={props.environmentId}
               markdownStyles={styles}
@@ -1581,7 +1596,7 @@ function renderFeedEntry(
         {attachments.map((attachment) => {
           return isImageAttachment(attachment) ? (
             <MessageAttachmentImage
-              key={attachment.id}
+              key={`${message.id}:${attachment.id}`}
               environmentId={props.environmentId}
               attachmentId={attachment.id}
               name={attachment.name}
@@ -1591,14 +1606,17 @@ function renderFeedEntry(
             />
           ) : isFileAttachment(attachment) ? (
             <MessageAttachmentFile
-              key={attachment.id}
+              key={`${message.id}:${attachment.id}`}
               environmentId={props.environmentId}
               attachment={attachment}
               onPressPreview={props.onPressPreview}
               onPressVideo={props.onPressVideo}
             />
           ) : (
-            <MessageAttachmentUnknown key={attachment.id} name={attachment.name} />
+            <MessageAttachmentUnknown
+              key={`${message.id}:${attachment.id}`}
+              name={attachment.name}
+            />
           );
         })}
         {showAssistantMeta && message.checkpointSummary ? (
@@ -1608,7 +1626,7 @@ function renderFeedEntry(
           />
         ) : null}
         {showAssistantMeta ? (
-          <View className="mt-1 flex-row items-center gap-1">
+          <View key={message.id} className="mt-1 flex-row items-center gap-1">
             <CopyTextButton
               accessibilityLabel="Copy message"
               text={renderedText}
@@ -2818,7 +2836,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
 
   const renderItem = (info: { item: PendingThreadFeedEntry; index: number }) => (
     <Animated.View
-      key={info.item.id}
+      key={threadFeedRenderKey(info.item)}
       entering={disclosureToggleSettling ? THREAD_FEED_DISCLOSURE_ENTER_TRANSITION : undefined}
     >
       <MessageImageGalleryScope
@@ -2827,7 +2845,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         threadId={props.threadId}
         workspaceRoot={props.workspaceRoot}
       >
-        <ThreadMediaVisibility>
+        <ThreadMediaVisibility entryId={info.item.id}>
           {renderFeedEntry(info, {
             environmentId: props.environmentId,
             dispatchingMessageId: props.dispatchingMessageId,
@@ -2970,17 +2988,12 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
               endFollowEnabled && !disclosureToggleSettling ? false : maintainVisibleContentPosition
             }
             data={presentedFeed}
+            recycleItems
             extraData={listAppearanceData}
             renderItem={renderItem}
             viewabilityConfig={THREAD_MEDIA_VIEWABILITY_CONFIG}
             keyExtractor={(entry) => entry.id}
-            getItemType={(entry) =>
-              entry.type !== "message"
-                ? entry.type
-                : resolveUserMessagePresentation(entry.message).attribution === "automation"
-                  ? "message:automation"
-                  : `message:${entry.message.role}`
-            }
+            getItemType={threadFeedItemType}
             getFixedItemSize={getFixedItemSize}
             // Virtualized rows must move with their measurements. Native layout
             // transitions can retain stale positions during sync, even at duration 0.

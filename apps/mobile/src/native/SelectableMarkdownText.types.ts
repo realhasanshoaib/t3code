@@ -67,6 +67,8 @@ export interface MarkdownLinkCustomization {
 }
 
 export interface SelectableMarkdownTextProps {
+  /** Identifies a document when a virtualized row reuses the native text view. */
+  readonly documentKey?: string;
   readonly markdown: string;
   readonly textStyle: NativeMarkdownTextStyle;
   readonly skills?: ReadonlyArray<SelectableMarkdownSkill>;

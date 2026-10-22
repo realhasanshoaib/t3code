@@ -26,7 +26,7 @@ import * as ConnectionWakeups from "../connection/wakeups.ts";
 import { safeErrorLogAttributes } from "../errors/safeLog.ts";
 import * as Persistence from "../platform/persistence.ts";
 import { runCachePersistence } from "./cachePersistence.ts";
-import { subscribeDynamic } from "../rpc/client.ts";
+import { subscribeDynamicWithSession } from "../rpc/client.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import * as ShellSnapshotLoader from "./shellSnapshotHttp.ts";
 import type { DeferredShellSnapshot } from "./shellPullRequests.ts";
@@ -91,7 +91,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     error: Option.none(),
   });
   const awaitingCompletion = yield* Ref.make(false);
-  const hasAuthoritativeSnapshot = yield* Ref.make(false);
+  const authoritativeSnapshotSession = yield* Ref.make<RpcSession | null>(null);
   const source = yield* Ref.make<ServerConfig["environment"] | undefined>(undefined);
   const activeSubscriptionSession = yield* Ref.make<RpcSession | null>(null);
   const latestLiveSnapshot = yield* Ref.make<Option.Option<OrchestrationV2ShellSnapshot>>(
@@ -180,9 +180,12 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
   const snapshotWriteLock = yield* Semaphore.make(1);
 
   const applyItems = Effect.fn("EnvironmentShellState.applyItems")(function* (
-    items: ReadonlyArray<OrchestrationV2ShellStreamItem>,
+    taggedItems: ReadonlyArray<readonly [RpcSession, OrchestrationV2ShellStreamItem]>,
     pendingLinkIds?: ReadonlySet<ThreadId>,
   ) {
+    const producer = yield* Ref.get(activeSubscriptionSession);
+    const items = taggedItems.filter(([session]) => session === producer).map(([, item]) => item);
+    if (items.length === 0) return;
     const replacesPendingLinks =
       pendingLinkIds === undefined &&
       items.some(
@@ -190,6 +193,9 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
       );
     if (replacesPendingLinks) {
       yield* cancelActiveFill;
+      // Cancellation can await an old fill's finalizer while a replacement session starts.
+      // Buffered frames still belong to their producer, even after that session is gone.
+      if ((yield* Ref.get(activeSubscriptionSession)) !== producer) return;
     }
     const initial = yield* SubscriptionRef.get(state);
     let waiting = yield* Ref.get(awaitingCompletion);
@@ -245,7 +251,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     }
     yield* SubscriptionRef.set(state, next);
     if (receivedSnapshot) {
-      yield* Ref.set(hasAuthoritativeSnapshot, true);
+      yield* Ref.set(authoritativeSnapshotSession, producer);
     }
     if (next.snapshot !== initial.snapshot && Option.isSome(next.snapshot)) {
       yield* Queue.offer(persistence, next.snapshot.value);
@@ -326,7 +332,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
 
   yield* setSynchronizing;
   yield* Effect.forkScoped(
-    subscribeDynamic(
+    subscribeDynamicWithSession(
       ORCHESTRATION_V2_WS_METHODS.subscribeShell,
       Effect.fn("EnvironmentShellState.makeSubscribeInput")(function* (session) {
         const config = yield* session.initialConfig.pipe(Effect.orElseSucceed(() => undefined));
@@ -344,7 +350,9 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         ) {
           // A cursor only identifies state within one server lifetime. Older servers
           // omit the epoch, so replacement sessions retain the authoritative reload.
-          yield* Ref.set(hasAuthoritativeSnapshot, false);
+          yield* Ref.set(authoritativeSnapshotSession, null);
+        } else if ((yield* Ref.get(authoritativeSnapshotSession)) === previousSession) {
+          yield* Ref.set(authoritativeSnapshotSession, session);
         }
         yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
         yield* setSynchronizing;
@@ -352,7 +360,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         // Disk caches may be incomplete. Once authoritative data arrives,
         // replacement sessions can replay from memory; unusable cursors cause
         // the server to send a full snapshot.
-        let canResume = yield* Ref.get(hasAuthoritativeSnapshot);
+        let canResume = (yield* Ref.get(authoritativeSnapshotSession)) === session;
         let current = yield* SubscriptionRef.get(state);
         if (!canResume || Option.isNone(current.snapshot)) {
           const prepared = yield* SubscriptionRef.get(supervisor.prepared).pipe(
@@ -382,10 +390,10 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
                 ? []
                 : httpSnapshot.value.threads.map((thread) => thread.id),
             );
-            yield* applyItems([{ kind: "snapshot", snapshot }], pendingLinkIds);
-            canResume = true;
+            yield* applyItems([[session, { kind: "snapshot", snapshot }]], pendingLinkIds);
+            canResume = (yield* Ref.get(authoritativeSnapshotSession)) === session;
             current = yield* SubscriptionRef.get(state);
-            if (Option.isSome(current.snapshot)) {
+            if (canResume && Option.isSome(current.snapshot)) {
               yield* fillDeferredPullRequests(httpSnapshot.value, current.snapshot.value);
             }
           }

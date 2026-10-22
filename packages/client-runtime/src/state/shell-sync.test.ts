@@ -31,6 +31,7 @@ import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import { makeEnvironmentShellState } from "./shell.ts";
 import * as ShellSnapshotLoader from "./shellSnapshotHttp.ts";
+import type { DeferredShellSnapshot } from "./shellPullRequests.ts";
 import { v2Project, v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
 
 const TARGET = new PrimaryConnectionTarget({
@@ -81,6 +82,8 @@ function session(client: WsRpcProtocolClient, source: SessionSource = {}): RpcSe
 
 const makeResumeHarness = Effect.fn("TestShell.makeResumeHarness")(function* (
   source: SessionSource = {},
+  loadSnapshot: (count: number) => Option.Option<DeferredShellSnapshot> = (count) =>
+    Option.some({ ...v2ShellSnapshot, snapshotSequence: count * 10 }),
 ) {
   const events = yield* Queue.unbounded<OrchestrationV2ShellStreamItem>();
   const subscriptions = yield* Queue.unbounded<number | undefined>();
@@ -116,10 +119,7 @@ const makeResumeHarness = Effect.fn("TestShell.makeResumeHarness")(function* (
     clear: () => Effect.void,
   });
   const snapshotLoader = ShellSnapshotLoader.ShellSnapshotLoader.of({
-    load: () =>
-      Ref.updateAndGet(loads, (count) => count + 1).pipe(
-        Effect.map((count) => Option.some({ ...v2ShellSnapshot, snapshotSequence: count * 10 })),
-      ),
+    load: () => Ref.updateAndGet(loads, (count) => count + 1).pipe(Effect.map(loadSnapshot)),
   });
   const state = yield* makeEnvironmentShellState().pipe(
     Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
@@ -245,6 +245,88 @@ describe("environment shell synchronization", () => {
       yield* TestClock.adjust("30 seconds");
       expect(yield* Queue.take(saved)).toEqual(filled);
     }),
+  );
+
+  it.effect("rejects an old epoch snapshot blocked on deferred-link cancellation", () =>
+    Effect.gen(function* () {
+      const fillStarted = yield* Deferred.make<void>();
+      const cancellationStarted = yield* Deferred.make<void>();
+      const finishCancellation = yield* Deferred.make<void>();
+      const harness = yield* makeResumeHarness({}, (count) =>
+        count === 1
+          ? Option.some({
+              ...v2ShellSnapshot,
+              snapshotSequence: 10,
+              loadPullRequests: Deferred.succeed(fillStarted, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.ensuring(
+                  Deferred.succeed(cancellationStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(finishCancellation)),
+                  ),
+                ),
+              ),
+            })
+          : Option.none(),
+      );
+      yield* Deferred.await(fillStarted);
+      yield* Queue.offer(harness.events, {
+        kind: "snapshot",
+        snapshot: {
+          ...v2ShellSnapshot,
+          snapshotSequence: 40,
+          projects: [{ ...v2Project, title: "Obsolete server" }],
+        },
+      });
+      yield* Deferred.await(cancellationStarted);
+      yield* harness.replace({ serverEpoch: "epoch-2" });
+      expect(yield* Queue.take(harness.subscriptions)).toBeUndefined();
+      yield* Deferred.succeed(finishCancellation, undefined);
+
+      // Metadata cannot authorize a cursor. Its arrival drains the blocked frame before C
+      // reconnects, while B's full socket snapshot remains pending.
+      const repositoryIdentity = {
+        canonicalKey: "github.com/example/new-server",
+        locator: {
+          source: "git-remote" as const,
+          remoteName: "origin",
+          remoteUrl: "https://github.com/example/new-server.git",
+        },
+      };
+      yield* Queue.offer(harness.events, {
+        kind: "snapshot",
+        snapshot: {
+          ...v2ShellSnapshot,
+          projects: [{ ...v2Project, repositoryIdentity }],
+        },
+        resolvedRepositoryIdentityRoots: [v2Project.workspaceRoot],
+      });
+      yield* SubscriptionRef.changes(harness.state).pipe(
+        Stream.filter(
+          (value) =>
+            Option.isSome(value.snapshot) &&
+            value.snapshot.value.projects[0]?.repositoryIdentity?.canonicalKey ===
+              repositoryIdentity.canonicalKey,
+        ),
+        Stream.runHead,
+      );
+      yield* harness.replace({ serverEpoch: "epoch-2" });
+      expect(yield* Queue.take(harness.subscriptions)).toBeUndefined();
+      expect(yield* Ref.get(harness.loads)).toBe(3);
+      const pending = yield* SubscriptionRef.get(harness.state);
+      expect(Option.getOrThrow(pending.snapshot).projects[0]?.title).toBe("Replayed");
+      expect(pending.status).toBe("synchronizing");
+
+      const replacement = {
+        ...v2ShellSnapshot,
+        snapshotSequence: 50,
+        projects: [{ ...v2Project, title: "Current server", repositoryIdentity }],
+      };
+      yield* Queue.offerAll(harness.events, [
+        { kind: "snapshot", snapshot: replacement },
+        { kind: "synchronized" },
+      ]);
+      expect(Option.getOrThrow((yield* harness.awaitLive).snapshot)).toEqual(replacement);
+    }).pipe(Effect.scoped),
   );
 
   it.effect("resumes a replacement shell session from memory until replay completes", () =>
